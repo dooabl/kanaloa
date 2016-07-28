@@ -1,16 +1,16 @@
 package kanaloa.reactive.dispatcher
 
-import akka.actor.{ActorRefFactory, ActorSystem, Props}
+import akka.actor.{ActorRef, ActorRefFactory, ActorSystem, Props}
 import akka.testkit.{TestActors, ImplicitSender, TestKit, TestProbe}
 import com.typesafe.config.{Config, ConfigException, ConfigFactory}
 import kanaloa.reactive.dispatcher.ApiProtocol.{ShutdownGracefully, ShutdownSuccessfully, WorkFailed, WorkRejected}
-import kanaloa.reactive.dispatcher.PerformanceSampler.Subscribe
 import kanaloa.reactive.dispatcher.metrics.{Metric, MetricsCollector, StatsDReporter}
 import kanaloa.reactive.dispatcher.queue._
 import kanaloa.reactive.dispatcher.queue.TestUtils.MessageProcessed
 import org.scalatest.OptionValues
+import org.scalatest.concurrent.Eventually
 
-import scala.concurrent.Future
+import scala.concurrent.{Promise, Future}
 import concurrent.duration._
 
 class DispatcherSpec extends SpecWithActorSystem with OptionValues {
@@ -21,7 +21,7 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
       val pwp = system.actorOf(Props(PullingDispatcher(
         "test",
         iterator,
-        Dispatcher.defaultDispatcherSettings().copy(workerPool = ProcessingWorkerPoolSettings(1), autoScaling = None),
+        Dispatcher.defaultDispatcherSettings().copy(workerPool = ProcessingWorkerPoolSettings(1), autothrottle = None),
         backend,
         metricsCollector = MetricsCollector(None),
         None,
@@ -95,7 +95,7 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
         PullingDispatcher.props(
           "test",
           iterator,
-          delayedBackend
+          promiseBackend(Promise[ActorRef])
         )(ResultChecker.complacent)
       )
 
@@ -175,7 +175,7 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
             |kanaloa.default-dispatcher {
             |  updateInterval = 300s
             |  circuitBreaker.enabled = off
-            |  autoScaling.enabled = off
+            |  autothrottle.enabled = off
             |}""".stripMargin
         ) //make sure regulator doesn't interfere
       )(ResultChecker.complacent))
@@ -192,13 +192,73 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
 
       (received.length.toDouble / numOfWork.toDouble) shouldBe 0.5 +- 0.07
     }
+
+    //todo: move this to integration test once the integration re-org test PR is merged.
+    "start to reject work when worker creation fails" in new ScopeWithActor with Eventually with Backends {
+      import system.dispatcher
+      val pd = system.actorOf(PushingDispatcher.props(
+        "test",
+        promiseBackend(Promise[ActorRef].failure(new Exception("failing backend"))),
+        ConfigFactory.parseString(
+          """
+            |kanaloa.default-dispatcher {
+            |  updateInterval = 10ms
+            |  backPressure {
+            |    durationOfBurstAllowed = 10ms
+            |    referenceDelay = 2s
+            |  }
+            |}""".stripMargin
+        )
+      )(ResultChecker.complacent))
+
+      eventually {
+        (1 to 100).foreach(_ ⇒ pd ! "a work")
+        expectMsgType[WorkRejected](20.milliseconds)
+      }(PatienceConfig(5.seconds, 40.milliseconds))
+
+    }
+
+    //todo: move this to integration test once the integration re-org test PR is merged. 
+    "be able to pick up work after worker finally becomes available" in new ScopeWithActor with Eventually with Backends {
+      import scala.concurrent.ExecutionContext.Implicits.global
+      val backendActorPromise = Promise[ActorRef]
+      val dispatcher = system.actorOf(PushingDispatcher.props(
+        "test",
+        promiseBackend(backendActorPromise),
+        ConfigFactory.parseString(
+          """
+            |kanaloa.default-dispatcher {
+            |  updateInterval = 50ms
+            |  backPressure {
+            |    durationOfBurstAllowed = 30ms
+            |    referenceDelay = 1s
+            |  }
+            |}""".stripMargin
+        )
+      )(ResultChecker.complacent))
+
+      //reach the point that it starts to reject work
+      eventually {
+        (1 to 30).foreach(_ ⇒ dispatcher ! "a work")
+        expectMsgType[WorkRejected](20.milliseconds)
+      }(PatienceConfig(5.seconds, 40.milliseconds))
+
+      backendActorPromise.complete(util.Success(system.actorOf(TestActors.echoActorProps)))
+      //recovers after the worker become available
+      eventually {
+        dispatcher ! "a work"
+        expectMsg(10.milliseconds, "a work")
+      }(PatienceConfig(5.seconds, 40.milliseconds))
+
+    }
+
   }
 
   "readConfig" should {
     "use default settings when nothing is in config" in {
       val (settings, reporter) = Dispatcher.readConfig("example", ConfigFactory.empty)
       settings.workRetry === 0
-      settings.autoScaling shouldBe defined
+      settings.autothrottle shouldBe defined
       reporter shouldBe empty
     }
 
@@ -237,16 +297,16 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
 
       val (settings, _) = Dispatcher.readConfig("example", ConfigFactory.parseString(cfgStr))
       settings.workRetry === 29
-      settings.autoScaling shouldBe defined
+      settings.autothrottle shouldBe defined
     }
 
-    "turn off autoScaling if set to off" in {
+    "turn off autothrottle if set to off" in {
       val cfgStr =
         """
             kanaloa {
               dispatchers {
                 example {
-                  autoScaling {
+                  autothrottle {
                     enabled = off
                   }
                 }
@@ -254,7 +314,7 @@ class DispatcherSpec extends SpecWithActorSystem with OptionValues {
             }
           """
       val (settings, _) = Dispatcher.readConfig("example", ConfigFactory.parseString(cfgStr))
-      settings.autoScaling shouldBe None
+      settings.autothrottle shouldBe None
     }
 
     "turn off circuitBreaker if set to off" in {

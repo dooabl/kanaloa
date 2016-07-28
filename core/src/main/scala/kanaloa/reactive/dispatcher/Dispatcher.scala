@@ -25,7 +25,7 @@ trait Dispatcher extends Actor {
 
   protected def queueProps: Props
 
-  protected lazy val queue = context.actorOf(queueProps, name + "-backing-queue")
+  protected lazy val queue = context.actorOf(queueProps, "queue")
 
   private[dispatcher] val processor = {
     val props = QueueProcessor.default(
@@ -36,13 +36,13 @@ trait Dispatcher extends Actor {
       settings.circuitBreaker
     )(resultChecker)
 
-    context.actorOf(props, name + "-queue-processor")
+    context.actorOf(props, "queue-processor")
   }
 
   context watch processor
 
-  private val autoScaler = settings.autoScaling.foreach { s ⇒
-    context.actorOf(AutoScaling.default(processor, s, metricsCollector), name + "-auto-scaler")
+  private val autothrottler = settings.autothrottle.foreach { s ⇒
+    context.actorOf(Autothrottler.default(processor, s, metricsCollector), "auto-scaler")
   }
 
   def receive: Receive = ({
@@ -62,7 +62,7 @@ object Dispatcher {
     workerPool:     ProcessingWorkerPoolSettings,
     regulator:      Option[Regulator.Settings],
     circuitBreaker: Option[CircuitBreakerSettings],
-    autoScaling:    Option[AutoScalingSettings]
+    autothrottle:   Option[AutothrottleSettings]
   ) {
     val performanceSamplerSettings = PerformanceSampler.PerformanceSamplerSettings(updateInterval)
   }
@@ -86,7 +86,7 @@ object Dispatcher {
     settings.copy(
       regulator = readComponent[Regulator.Settings]("backPressure", config),
       circuitBreaker = readComponent[CircuitBreakerSettings]("circuitBreaker", config),
-      autoScaling = readComponent[AutoScalingSettings]("autoScaling", config)
+      autothrottle = readComponent[AutothrottleSettings]("autothrottle", config)
     )
   }
 
@@ -121,7 +121,7 @@ case class PushingDispatcher(
   protected lazy val queueProps = Queue.default(metricsCollector, WorkSettings(settings.workRetry, settings.workTimeout))
 
   settings.regulator.foreach { rs ⇒
-    context.actorOf(Regulator.props(rs, metricsCollector, self))
+    context.actorOf(Regulator.props(rs, metricsCollector, self), "regulator")
   }
 
   /**
@@ -188,7 +188,7 @@ object PullingDispatcher {
   )(resultChecker: ResultChecker)(implicit system: ActorSystem) = {
     val (settings, reporter) = Dispatcher.readConfig(name, rootConfig)
     //for pulling dispatchers because only a new idle worker triggers a pull of work, there maybe cases where there are two idle workers but the system should be deemed as fully utilized.
-    val metricsCollector = MetricsCollector(reporter, settings.performanceSamplerSettings.copy(fullyUtilized = _ <= 2))
+    val metricsCollector = MetricsCollector(reporter, settings.performanceSamplerSettings)
     val toBackend = implicitly[BackendAdaptor[T]]
     Props(PullingDispatcher(name, iterator, settings, toBackend(backend), metricsCollector, sendResultsTo, resultChecker)).withDeploy(Deploy.local)
   }
