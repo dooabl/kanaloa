@@ -305,4 +305,3 @@ private[queue] object WorkSender {
   }
 
 }
-
